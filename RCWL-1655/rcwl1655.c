@@ -2,13 +2,13 @@
  * @file   rcwl1655.c
  * @author zgs
  * @brief  超声波传感器驱动
- * @version 2.0
+ * @version 1.0
  * @date   2025-12-29
  * 
  * @copyright Copyright (c) 2025
  * 
  */
- 
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -130,7 +130,7 @@ static int rcwl1655_write_cmd(struct i2c_client *client, u8 cmd)
     ret = i2c_master_send(client, &cmd, 1);
     if (ret != 1) {
         return -EIO;
-    }
+    }   
 
     return 0;
 }
@@ -162,7 +162,7 @@ static int rcwl1655_start(struct rcwl1655_dev *rcwl_dev)
         schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
     }
     mutex_unlock(&rcwl_dev->lock);
-    
+
     return 0;
 }
 
@@ -256,11 +256,28 @@ static int rcwl1655_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+static __poll_t rcwl1655_poll(struct file *filp, struct poll_table_struct *wait)
+{
+    struct rcwl1655_dev *rcwl_dev = filp->private_data;
+    unsigned int mask = 0;
+    
+    poll_wait(filp, &rcwl_dev->wq, wait);
+    
+    mutex_lock(&rcwl_dev->lock);
+    if (rcwl_dev->state == RCWL_IDLE) {
+        mask |= POLLIN | POLLRDNORM;
+    }
+    mutex_unlock(&rcwl_dev->lock);
+
+    return mask;
+}
+
 static const struct file_operations rcwl1655_ops = {
 	.owner = THIS_MODULE,
 	.open = rcwl1655_open,
 	.read = rcwl1655_read,
 	.release = rcwl1655_release,
+    .poll = rcwl1655_poll,
 };
 
 static int rcwl1655_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
