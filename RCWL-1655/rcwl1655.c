@@ -2,7 +2,7 @@
  * @file   rcwl1655.c
  * @author zgs
  * @brief  超声波传感器驱动
- * @version 1.0
+ * @version 2.1
  * @date   2025-12-29
  * 
  * @copyright Copyright (c) 2025
