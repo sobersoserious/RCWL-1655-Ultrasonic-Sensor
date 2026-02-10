@@ -37,6 +37,7 @@
 ### 软件环境
 
 * LinuxKernel：**5.15（Qualcomm BSP）**
+* 构建环境：**Yocto**
 * 编译器：aarch64-linux-gnu-gcc
 * 构建方式：KernelModule(Out-of-tree)
 
