@@ -188,7 +188,7 @@ static void rcwl1655_poll_work(struct work_struct *work)
     if (ret < 0) {
         schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
         mutex_unlock(&rcwl_dev->lock);
-        pr_err("rcwl1655 i2c_master_recv error\n");
+        // pr_err("rcwl1655 i2c_master_recv error\n");
         return;
     }
     if (ret == 3) {
@@ -340,11 +340,17 @@ static int rcwl1655_i2c_probe(struct i2c_client *client, const struct i2c_device
     rcwl_dev->state = RCWL_IDLE;
     rcwl_dev->poll_interval_ms = 10;
 
-    rcwl1655_start(rcwl_dev);
+    ret = rcwl1655_start(rcwl_dev);
+    if (ret < 0) {
+        dev_info(&client->dev, "rcwl1655_start ERROR!");
+        goto err_sysfs_remove;
+    }
 
     dev_info(&client->dev, "rcwl1655_i2c_probe Succeed\n");
     return 0;
 
+err_sysfs_remove:
+    sysfs_remove_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
 err_device_destroy:
     device_destroy(rcwl_dev->class, rcwl_dev->devid);
 err_class_destroy:
