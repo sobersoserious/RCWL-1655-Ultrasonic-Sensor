@@ -39,32 +39,40 @@
 
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
+#include <linux/idr.h>
 
 #include "rcwl1655.h"
 
 #define RCWL1655_NAME   "rcwl1655"
+#define RCWL1655_MAX_DEVICES 32
+
+static DEFINE_IDA(rcwl1655_ida);
+static dev_t rcwl1655_base_devid;
+static struct class *rcwl1655_class;
 
 enum rcwl1655_state {
     RCWL_IDLE,
     RCWL_MEASURING,
 };
-
 struct rcwl1655_dev {
     struct i2c_client *client;
     struct mutex lock;
-
+    
+    int id;
     dev_t devid;
     struct cdev cdev;
-    struct class *class;
     struct device *device;
 
     u32 distance_raw;
+    u32 frame_id;
+    u64 last_sample_ns;
 
     struct delayed_work poll_work;
     wait_queue_head_t wq;
 
     enum rcwl1655_state state;
     bool RCWL_RUNNING;
+    int open_count;
 
     u32 poll_interval_ms;
 };
@@ -128,6 +136,9 @@ static int rcwl1655_write_cmd(struct i2c_client *client, u8 cmd)
     int ret;
     
     ret = i2c_master_send(client, &cmd, 1);
+    if (ret < 0)
+      return ret;
+
     if (ret != 1) {
         return -EIO;
     }   
@@ -140,30 +151,24 @@ static int rcwl1655_start(struct rcwl1655_dev *rcwl_dev)
     int ret;
 
     mutex_lock(&rcwl_dev->lock);
-    if (rcwl_dev->RCWL_RUNNING != true) {
-        rcwl_dev->RCWL_RUNNING = true;
-        ret = rcwl1655_write_cmd(rcwl_dev->client, RCWL1655_READ_CMD);
-        if (ret < 0) {
-            mutex_unlock(&rcwl_dev->lock);
-            pr_err("rcwl1655_write_cmd first error\n");
-            return -EIO;
-        }
-        rcwl_dev->state = RCWL_MEASURING;
-        schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
+    if (!rcwl_dev->RCWL_RUNNING) {
+        ret = -ESHUTDOWN;
+        goto out_unlock;
     }
-    else if (rcwl_dev->RCWL_RUNNING == true) {
-        ret = rcwl1655_write_cmd(rcwl_dev->client, RCWL1655_READ_CMD);
-        if (ret < 0) {
-            mutex_unlock(&rcwl_dev->lock);
-            pr_err("rcwl1655_write_cmd error\n");
-            return -EIO;
-        }
-        rcwl_dev->state = RCWL_MEASURING;
-        schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
+
+    ret = rcwl1655_write_cmd(rcwl_dev->client, RCWL1655_READ_CMD);
+    if (ret < 0) {
+        dev_err(&rcwl_dev->client->dev, "write command failed: %d\n", ret);
+        goto out_unlock;
     }
+
+    rcwl_dev->state = RCWL_MEASURING;
+    schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
+
+out_unlock:
     mutex_unlock(&rcwl_dev->lock);
 
-    return 0;
+    return ret;
 }
 
 static void rcwl1655_poll_work(struct work_struct *work)
@@ -180,32 +185,61 @@ static void rcwl1655_poll_work(struct work_struct *work)
 
     if (rcwl_dev->state == RCWL_IDLE) {
         mutex_unlock(&rcwl_dev->lock);
-        rcwl1655_start(rcwl_dev);
+        ret = rcwl1655_start(rcwl_dev);
+        if (ret < 0) {
+            mutex_lock(&rcwl_dev->lock);
+            if (rcwl_dev->RCWL_RUNNING)
+                schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
+            mutex_unlock(&rcwl_dev->lock);
+        }
         return;
     }
 
-    ret = i2c_master_recv(rcwl_dev->client, buf, 3);
-    if (ret < 0) {
-        schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
-        mutex_unlock(&rcwl_dev->lock);
-        // pr_err("rcwl1655 i2c_master_recv error\n");
-        return;
-    }
-    if (ret == 3) {
-        rcwl_dev->distance_raw = (buf[0] << 16) | (buf[1] << 8) | buf[2];
-        rcwl_dev->state = RCWL_IDLE;
-        wake_up_interruptible(&rcwl_dev->wq);
+    ret = i2c_master_recv(rcwl_dev->client, buf, sizeof(buf));
+    if (ret != sizeof(buf)) {
         schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
         mutex_unlock(&rcwl_dev->lock);
         return;
     }
+
+    rcwl_dev->distance_raw = (buf[0] << 16) | (buf[1] << 8) | buf[2];
+    rcwl_dev->frame_id++;
+    rcwl_dev->last_sample_ns = ktime_get_ns();
+    rcwl_dev->state = RCWL_IDLE;
+    wake_up_interruptible(&rcwl_dev->wq);
+    schedule_delayed_work(&rcwl_dev->poll_work, msecs_to_jiffies(rcwl_dev->poll_interval_ms));
     mutex_unlock(&rcwl_dev->lock);
 }
 
 static int rcwl1655_open(struct inode *inode, struct file *filp)
 {
     struct rcwl1655_dev *rcwl_dev = container_of(inode->i_cdev, struct rcwl1655_dev, cdev);
+    int ret;
+
     filp->private_data = rcwl_dev;
+
+    mutex_lock(&rcwl_dev->lock);
+    if (rcwl_dev->open_count != 0) {
+        mutex_unlock(&rcwl_dev->lock);
+        pr_err("%s: open failed. \n", __func__);
+        return -EBUSY;
+    }
+    rcwl_dev->open_count = 1;
+    rcwl_dev->RCWL_RUNNING = true;
+    rcwl_dev->frame_id = 0;
+    rcwl_dev->last_sample_ns = 0;
+    mutex_unlock(&rcwl_dev->lock);
+
+    ret = rcwl1655_start(rcwl_dev);
+    if (ret < 0) {
+        mutex_lock(&rcwl_dev->lock);
+        rcwl_dev->open_count = 0;
+        rcwl_dev->RCWL_RUNNING = false;
+        rcwl_dev->state = RCWL_IDLE;
+        mutex_unlock(&rcwl_dev->lock);
+        pr_err("%s: rcwl1655 start failed.\n", __func__);
+        return ret;
+    }
 
     return 0;
 }
@@ -213,46 +247,58 @@ static int rcwl1655_open(struct inode *inode, struct file *filp)
 static ssize_t rcwl1655_read(struct file *filp, char __user *buf, size_t cnt, loff_t *off)
 {
     struct rcwl1655_dev *rcwl_dev = filp->private_data;
+    struct rcwl1655_sample sample;
     int ret;
     unsigned long uncopied;
 
-    if (cnt < sizeof(rcwl_dev->distance_raw)) {
-        pr_err("rcwl1655 recived cnt do not enough\n");
+    if (cnt < sizeof(sample)) {
+        dev_err(&rcwl_dev->client->dev, "%s: read buffer too small\n", __func__);
         return -EINVAL;
     }
 
     mutex_lock(&rcwl_dev->lock);
     if (rcwl_dev->RCWL_RUNNING != true) {
         mutex_unlock(&rcwl_dev->lock);
-        pr_err("rcwl1655 is already Stopped\n");
+        dev_err(&rcwl_dev->client->dev, "%s: device already stopped\n", __func__);
         return -EFAULT;
     }
     mutex_unlock(&rcwl_dev->lock);
 
     ret = wait_event_interruptible(rcwl_dev->wq, rcwl_dev->state == RCWL_IDLE);
     if (ret < 0) {
-        pr_err("rcwl1655 Sudden Stopped\n");
+        dev_err(&rcwl_dev->client->dev, "%s: wait interrupted\n", __func__);
         return ret;
     }
 
     mutex_lock(&rcwl_dev->lock);
-    uncopied = copy_to_user(buf, &rcwl_dev->distance_raw, sizeof(u32));
-    if (uncopied != 0) {
-        mutex_unlock(&rcwl_dev->lock);
-        pr_err("rcwl1655 copy_to_user error\n");
-        return -EFAULT;
-    }
+    sample.distance_raw = rcwl_dev->distance_raw;
+    sample.frame_id = rcwl_dev->frame_id;
+    sample.timestamp_ns = rcwl_dev->last_sample_ns;
     mutex_unlock(&rcwl_dev->lock);
 
-    pr_info("rcwl1655 copy_to_user success\n");
+    uncopied = copy_to_user(buf, &sample, sizeof(sample));
+    if (uncopied != 0) {
+        dev_err(&rcwl_dev->client->dev, "%s: copy_to_user error\n", __func__);
+        return -EFAULT;
+    }
 
-    return sizeof(u32);
+    return sizeof(sample);
 }
 
 static int rcwl1655_release(struct inode *inode, struct file *filp)
 {
+    struct rcwl1655_dev *rcwl_dev = filp->private_data;
+
+    mutex_lock(&rcwl_dev->lock);
+    rcwl_dev->open_count = 0;
+    rcwl_dev->RCWL_RUNNING = false;
+    mutex_unlock(&rcwl_dev->lock);
+
+    wake_up_interruptible_all(&rcwl_dev->wq);
+    cancel_delayed_work_sync(&rcwl_dev->poll_work);
+
     filp->private_data = NULL;
-    
+
     return 0;
 }
 
@@ -280,91 +326,99 @@ static const struct file_operations rcwl1655_ops = {
     .poll = rcwl1655_poll,
 };
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int rcwl1655_i2c_probe(struct i2c_client *client)
+#else
 static int rcwl1655_i2c_probe(struct i2c_client *client, const struct i2c_device_id *id)
+#endif
 {
     int ret;
     struct rcwl1655_dev *rcwl_dev = NULL;
+    const char *label = NULL;
+    bool has_label;
+    const char *name;
 
     rcwl_dev = devm_kzalloc(&client->dev, sizeof(*rcwl_dev), GFP_KERNEL);
     if (!rcwl_dev) {
+        dev_err(&client->dev, "%s: kzalloc err.\n", __func__);
         return -ENOMEM;
     }
 
-    rcwl_dev->client = client;
-    mutex_init(&rcwl_dev->lock);
-
-    /* Registered cdevid */
-    ret = alloc_chrdev_region(&rcwl_dev->devid, 0, 1, RCWL1655_NAME);
-    if (ret < 0) {
-        dev_err(&client->dev, "alloc_chrdev_region Failed\n");
+    rcwl_dev->id = ida_alloc_max(&rcwl1655_ida, RCWL1655_MAX_DEVICES - 1, GFP_KERNEL);
+    if (rcwl_dev->id < 0) {
+        dev_err(&client->dev, "%s: ida_alloc_max Failed\n", __func__);
+        ret = rcwl_dev->id;
         return ret;
     }
 
-    /* Registered cdev */
-    cdev_init(&rcwl_dev->cdev, &rcwl1655_ops);
-    ret = cdev_add(&rcwl_dev->cdev, rcwl_dev->devid, 1);
-    if (ret < 0) {
-        dev_err(&client->dev, "cdev_add Failed\n");
-        goto err_unregister_chrdev;
-    }
+    has_label = !of_property_read_string(client->dev.of_node, "label", &label);
+    if (has_label)
+        name = devm_kasprintf(&client->dev, GFP_KERNEL, "%s", label);
+    else
+        name = devm_kasprintf(&client->dev, GFP_KERNEL, "rcwl1655-%d", rcwl_dev->id);
 
-    /* created class */
-    rcwl_dev->class = class_create(THIS_MODULE, RCWL1655_NAME);
-    if (IS_ERR(rcwl_dev->class)) {
-        ret = PTR_ERR(rcwl_dev->class);
-        dev_err(&client->dev, "class_create Failed\n");
-        goto err_cdev_del;
-    }
-
-    /*creared device*/
-    rcwl_dev->device = device_create(rcwl_dev->class, NULL, rcwl_dev->devid, NULL, RCWL1655_NAME);
-    if (IS_ERR(rcwl_dev->device)) {
-        ret = PTR_ERR(rcwl_dev->device);
-        dev_err(&client->dev, "device_create Failed\n");
-        goto err_class_destroy;
-    }
-
-    dev_set_drvdata(rcwl_dev->device, rcwl_dev);
-
-    ret = sysfs_create_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
-    if (ret < 0) {
-        dev_err(&client->dev, "sysfs_create_group Failed\n");
-        goto err_device_destroy;
-    }
-    
-    i2c_set_clientdata(client, rcwl_dev);
+    rcwl_dev->client = client;
+    mutex_init(&rcwl_dev->lock);
 
     init_waitqueue_head(&rcwl_dev->wq);
     INIT_DELAYED_WORK(&rcwl_dev->poll_work, rcwl1655_poll_work);
     rcwl_dev->RCWL_RUNNING = false;
     rcwl_dev->state = RCWL_IDLE;
     rcwl_dev->poll_interval_ms = 10;
+    rcwl_dev->open_count = 0;
+    rcwl_dev->distance_raw = 0;
+    rcwl_dev->frame_id = 0;
+    rcwl_dev->last_sample_ns = 0;
 
-    ret = rcwl1655_start(rcwl_dev);
+    rcwl_dev->devid = MKDEV(MAJOR(rcwl1655_base_devid), rcwl_dev->id);
+
+    /* Registered cdev */
+    cdev_init(&rcwl_dev->cdev, &rcwl1655_ops);
+    ret = cdev_add(&rcwl_dev->cdev, rcwl_dev->devid, 1);
     if (ret < 0) {
-        dev_info(&client->dev, "rcwl1655_start ERROR!");
-        goto err_sysfs_remove;
+        dev_err(&client->dev, "%s: cdev_add Failed\n", __func__);
+        goto err_free_ida;
     }
 
-    dev_info(&client->dev, "rcwl1655_i2c_probe Succeed\n");
+    /* created device */
+    rcwl_dev->device = device_create(rcwl1655_class, &client->dev, rcwl_dev->devid, rcwl_dev, "%s", name);
+    if (IS_ERR(rcwl_dev->device)) {
+        ret = PTR_ERR(rcwl_dev->device);
+        dev_err(&client->dev, "%s: device_create Failed\n", __func__);
+        goto err_cdev_del;
+    }
+
+    dev_set_drvdata(rcwl_dev->device, rcwl_dev);
+
+    ret = sysfs_create_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
+    if (ret < 0) {
+        dev_err(&client->dev, "%s: sysfs_create_group Failed\n", __func__);
+        goto err_device_destroy;
+    }
+
+    i2c_set_clientdata(client, rcwl_dev);
+
+    dev_info(&client->dev, "%s: Succeed (id=%d)\n", __func__, rcwl_dev->id);
     return 0;
 
-err_sysfs_remove:
-    sysfs_remove_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
+// err_sysfs_remove:
+//     sysfs_remove_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
 err_device_destroy:
-    device_destroy(rcwl_dev->class, rcwl_dev->devid);
-err_class_destroy:
-    class_destroy(rcwl_dev->class);
+    device_destroy(rcwl1655_class, rcwl_dev->devid);
 err_cdev_del:
     cdev_del(&rcwl_dev->cdev);
-err_unregister_chrdev:
-    unregister_chrdev_region(rcwl_dev->devid, 1);
+err_free_ida:
+    ida_free(&rcwl1655_ida, rcwl_dev->id);
     return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static void rcwl1655_i2c_remove(struct i2c_client *client)
+#else
 static int rcwl1655_i2c_remove(struct i2c_client *client)
+#endif
 {
-    struct rcwl1655_dev *rcwl_dev = i2c_get_clientdata(client);    //unuse will make err
+    struct rcwl1655_dev *rcwl_dev = i2c_get_clientdata(client);
 
     mutex_lock(&rcwl_dev->lock);
     rcwl_dev->RCWL_RUNNING = false;
@@ -375,14 +429,15 @@ static int rcwl1655_i2c_remove(struct i2c_client *client)
 
     sysfs_remove_group(&rcwl_dev->device->kobj, &rcwl1655_attr_group);
 
-    device_destroy(rcwl_dev->class, rcwl_dev->devid);
-    class_destroy(rcwl_dev->class);
+    device_destroy(rcwl1655_class, rcwl_dev->devid);
     cdev_del(&rcwl_dev->cdev);
-    unregister_chrdev_region(rcwl_dev->devid, 1);
+    ida_free(&rcwl1655_ida, rcwl_dev->id);
 
-    dev_info(&client->dev, "RCWL1655 I2C Removed\n");
+    dev_info(&client->dev, "%s: I2C Removed (id=%d)\n", __func__, rcwl_dev->id);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
     return 0;
+#endif
 }
 
 static const struct of_device_id rcwl1655_of_match[] = {
@@ -412,13 +467,44 @@ static int __init rcwl1655_init_driver(void)
 {
     int ret;
 
+    ret = alloc_chrdev_region(&rcwl1655_base_devid, 0, RCWL1655_MAX_DEVICES, RCWL1655_NAME);
+    if (ret < 0) {
+        pr_err("rcwl1655: alloc_chrdev_region Failed\n");
+        return ret;
+    }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    rcwl1655_class = class_create(RCWL1655_NAME);
+#else
+    rcwl1655_class = class_create(THIS_MODULE, RCWL1655_NAME);
+#endif
+    if (IS_ERR(rcwl1655_class)) {
+        ret = PTR_ERR(rcwl1655_class);
+        rcwl1655_class = NULL;
+        pr_err("%s: class create failed.\n", __func__);
+        goto err_unregister_chrdev;
+    }
+
     ret = i2c_add_driver(&rcwl1655_driver);
+    if (ret < 0) {
+        pr_err("%s: i2c add failed.\n", __func__);
+        goto err_class_destroy;
+    }
+    return ret;
+
+err_class_destroy:
+    class_destroy(rcwl1655_class);
+    rcwl1655_class = NULL;
+err_unregister_chrdev:
+    unregister_chrdev_region(rcwl1655_base_devid, RCWL1655_MAX_DEVICES);
     return ret;
 }
 
 static void __exit rcwl1655_exit_driver(void)
 {
     i2c_del_driver(&rcwl1655_driver);
+    class_destroy(rcwl1655_class);
+    unregister_chrdev_region(rcwl1655_base_devid, RCWL1655_MAX_DEVICES);
 }
 
 module_init(rcwl1655_init_driver);
